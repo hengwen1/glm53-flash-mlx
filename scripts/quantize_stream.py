@@ -14,9 +14,10 @@ reloads through `mlx_vlm`-style loaders and through this package's `load.py` ali
 Recipe:
   * routed experts (`switch_mlp`, 97% of parameters)      --bits / --expert-bits, group 64
   * everything else quantizable                            --bits / --other-bits, group 64
-    (KDA projections, MLA low-rank projections, absorbed kv_b, shared experts, dense MLPs,
-    embeddings, lm_head). The six KDA input projections must share one width — the runtime
-    fuses them into a single matmul at load — which the recipe guarantees.
+    (MLA low-rank projections, absorbed kv_b, shared experts, dense MLPs,
+    embeddings, lm_head).
+  * KDA input projections: always 8-bit affine (needed for fused matmul kernel in stock omlx)
+    or --kda-bits
   * lightning-indexer projections: always 8-bit (block selection errors compound; ~0.2%)
     or --indexer-bits
   * kept as stored: the MoE router and its correction bias, mHC arrays (fp32 `base`/`scale`),
@@ -64,6 +65,14 @@ AUX_FILES = (
     "preprocessor_config.json", "video_preprocessor_config.json", "LICENSE",
 )
 GATING_BF16 = ("mlp.gate", "e_score_correction_bias")
+KDA_FUSED_PROJS = (
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.forget_gate.f_a_proj",
+    ".self_attn.g_a_proj",
+    ".self_attn.b_proj",
+)
 
 _MXFP_RE = re.compile(r"^mx(?:f(?:p)?)?([48])$")
 
@@ -100,6 +109,8 @@ def recipe(path: str, args) -> dict | None:
     for sub, params in (args.override or []):
         if sub in path:
             return quant_params(params, args.group_size)
+    if any(path.endswith(proj) for proj in KDA_FUSED_PROJS):
+        return quant_params(args.kda_params, args.group_size)
     if ".indexer." in path:
         return quant_params(args.indexer_params, args.group_size)
     if ".switch_mlp." in path:
@@ -160,6 +171,8 @@ def main() -> int:
                     help="routed experts (switch_mlp); defaults to --bits")
     ap.add_argument("--other-bits", dest="other_params", type=parse_bits, metavar="BITS",
                     help="everything else quantizable; defaults to --bits")
+    ap.add_argument("--kda-bits", dest="kda_params", type=parse_bits, metavar="BITS",
+                    help="linear attention (KDA) input projections; defaults to 8b affine")
     ap.add_argument("--indexer-bits", dest="indexer_params", type=parse_bits, metavar="BITS",
                     help="lightning-indexer projections; defaults to 8b affine")
     ap.add_argument("--group-size", type=int, default=64)
@@ -175,6 +188,7 @@ def main() -> int:
     args.override = [(o.split("=")[0], parse_bits(o.split("=")[1])) for o in (args.override or [])]
     args.expert_params = args.expert_params or args.bits_params
     args.other_params = args.other_params or args.bits_params
+    args.kda_params = args.kda_params or parse_bits(8)
     args.indexer_params = args.indexer_params or parse_bits(8)
 
     src, dst = Path(args.src), Path(args.dst)
@@ -193,6 +207,7 @@ def main() -> int:
     qpaths = quantizable_paths(cfg, args)
     print(f"quantizable modules: {len(qpaths)} (experts {fmt_bits(args.expert_params)}, "
           f"other {fmt_bits(args.other_params)}, "
+          f"kda {fmt_bits(args.kda_params)}, "
           f"indexer {fmt_bits(args.indexer_params)})", flush=True)
 
     index = json.load(open(src / "model.safetensors.index.json"))["weight_map"]
